@@ -1,0 +1,172 @@
+#!/bin/sh
+
+# Checkmk local checks for strongSwan on pfSense/OPNsense
+# - Phase1 (IKE): one service per connection, uses WebIF descr (config.xml)
+# - Phase2 (Child SA): one service per configured child (from swanctl --list-conns),
+#   matched against runtime state (from swanctl --list-sas)
+#
+# Output: <state> <service_name> <perfdata> <text>
+
+set -u
+
+IPSEC_BIN="/usr/local/sbin/ipsec"
+[ -x "$IPSEC_BIN" ] || IPSEC_BIN="$(command -v ipsec 2>/dev/null)"
+
+SWANCTL_BIN="/usr/local/sbin/swanctl"
+[ -x "$SWANCTL_BIN" ] || SWANCTL_BIN="$(command -v swanctl 2>/dev/null)"
+
+PHP_BIN="/usr/local/bin/php"
+[ -x "$PHP_BIN" ] || PHP_BIN="$(command -v php 2>/dev/null)"
+
+if [ -z "${IPSEC_BIN:-}" ] || [ ! -x "$IPSEC_BIN" ]; then
+  echo "3 ipsec - ipsec command not found"
+  exit 0
+fi
+if [ -z "${SWANCTL_BIN:-}" ] || [ ! -x "$SWANCTL_BIN" ]; then
+  echo "3 ipsec - swanctl command not found (needed for Phase2)"
+  exit 0
+fi
+
+OUT="$($IPSEC_BIN statusall 2>/dev/null)"
+if [ -z "$OUT" ]; then
+  echo "3 ipsec - no output from ipsec statusall (permissions?)"
+  exit 0
+fi
+
+TMPDIR="${TMPDIR:-/tmp}"
+P1MAP="$(mktemp "$TMPDIR/ipsec_p1map.XXXXXX")" || exit 0
+P2EXP="$(mktemp "$TMPDIR/ipsec_p2exp.XXXXXX")" || exit 0
+SASFILE="$(mktemp "$TMPDIR/ipsec_sas.XXXXXX")" || exit 0
+trap 'rm -f "$P1MAP" "$P2EXP" "$SASFILE"' EXIT
+
+# --- Runtime SAs (Phase2 names live here) ---
+"$SWANCTL_BIN" --list-sas 2>/dev/null > "$SASFILE"
+if [ ! -s "$SASFILE" ]; then
+  echo "3 ipsec - no output from swanctl --list-sas (charon running?)"
+  exit 0
+fi
+
+# --- P1 mapping: con<ikeid> -> WebIF descr ---
+: > "$P1MAP"
+if [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ]; then
+  "$PHP_BIN" -r '
+    @require_once("config.inc");
+    foreach ((array)config_get_path("ipsec/phase1", []) as $e) {
+      $id = $e["ikeid"] ?? null;
+      if ($id === null) continue;
+      $d = trim((string)($e["descr"] ?? ""));
+      if ($d === "") $d = "ikeid".$id;
+      echo "con".$id."\t".$d."\n";
+    }
+  ' 2>/dev/null > "$P1MAP"
+fi
+
+# --- Expected Phase2 children per IKE: from swanctl --list-conns ---
+"$SWANCTL_BIN" --list-conns 2>/dev/null | awk '
+  /^[a-zA-Z0-9_.-]+: IKE/ {
+    ike=$1; sub(/:$/,"",ike)
+    if (ike=="bypass" || ike=="bypasslan") ike=""
+  }
+  /^[ ]+[a-zA-Z0-9_.-]+: (TUNNEL|TRANSPORT)/ {
+    if (ike!="") {
+      child=$1; sub(/:$/,"",child)
+      print ike "\t" child
+    }
+  }
+' > "$P2EXP"
+
+# --- Evaluate ---
+printf '%s\n' "$OUT" | awk -v p1map="$P1MAP" -v p2exp="$P2EXP" -v sasfile="$SASFILE" '
+function normsvc(s,   t){
+  t=s
+  gsub(/[^A-Za-z0-9._-]+/, "_", t)
+  return t
+}
+BEGIN{
+  # P1 names: con2 -> "Sigma - DiCVT"
+  while ((getline < p1map) > 0) {
+    split($0,a,"\t")
+    if (a[1]!="") p1name[a[1]]=a[2]
+  }
+  close(p1map)
+
+  # expected children: exp_child[ike,child]=1
+  while ((getline < p2exp) > 0) {
+    split($0,a,"\t")
+    if (a[1]!="" && a[2]!="") { exp_child[a[1],a[2]]=1; exp_ike[a[1]]=1; }
+  }
+  close(p2exp)
+
+  # observed from swanctl --list-sas (file)
+  ike=""
+  while ((getline line < sasfile) > 0) {
+    # "con2: #502109, ESTABLISHED, ..."
+    if (line ~ /^[^ ]+: #[0-9]+, (ESTABLISHED|CONNECTING)/) {
+      ike=line
+      sub(/:.*/, "", ike)            # con2
+      if (line ~ / ESTABLISHED/) obs_ike_est[ike]++
+      if (line ~ / CONNECTING/)  obs_ike_con[ike]++
+      continue
+    }
+    # "  con2: #23123, reqid 2, INSTALLED, TUNNEL, ..."
+    if (ike != "" && line ~ /^[ ]+[^ ]+:[ ]+#[0-9]+, .* (INSTALLED|CONNECTING)/) {
+      child=line
+      sub(/^[ ]+/, "", child)
+      sub(/:.*/, "", child)          # child name (often same as ike, but may differ)
+      if (line ~ / INSTALLED/)  obs_child_inst[ike,child]++
+      if (line ~ / CONNECTING/) obs_child_con[ike,child]++
+    }
+  }
+  close(sasfile)
+}
+
+# Phase1 from ipsec statusall (multiple IKE SAs show up here)
+/(ESTABLISHED|CONNECTING)/ && $1 ~ /\[[0-9]+\]:$/ {
+  k=$1; sub(/\[[0-9]+\]:$/, "", k)   # con2
+  if ($0 ~ /ESTABLISHED/) ike_est[k]++
+  if ($0 ~ /CONNECTING/)  ike_con[k]++
+  seen_p1[k]=1
+}
+
+END{
+  # --- Phase1 services ---
+  for (k in seen_p1) {
+    e=(k in ike_est)?ike_est[k]:((k in obs_ike_est)?obs_ike_est[k]:0)
+    c=(k in ike_con)?ike_con[k]:((k in obs_ike_con)?obs_ike_con[k]:0)
+    disp=(k in p1name)?p1name[k]:k
+
+    st=2
+    if (e>0 && c==0) st=0
+    else if (e>0 && c>0) st=1
+    else if (e==0 && c>0) st=2
+    else st=2
+
+    svc=normsvc("ipsec_" disp)
+    printf "%d %s established=%d|connecting=%d IKE %s\n", st, svc, e, c, disp
+  }
+
+  # --- Phase2 services: one per expected child from swanctl --list-conns ---
+  for (ike in exp_ike) {
+    disp_p1=(ike in p1name)?p1name[ike]:ike
+
+    for (pair in exp_child) {
+      split(pair, x, SUBSEP)
+      if (x[1] != ike) continue
+      child = x[2]
+
+      inst = ((ike,child) in obs_child_inst) ? obs_child_inst[ike,child] : 0
+      con  = ((ike,child) in obs_child_con)  ? obs_child_con[ike,child]  : 0
+
+      st=2
+      if (inst>0 && con==0) st=0
+      else if (inst>0 && con>0) st=1
+      else if (inst==0 && con>0) st=2
+      else st=2
+
+      svc=normsvc("ipsec_Phase2_" disp_p1 "__" child)
+      printf "%d %s installed=%d|connecting=%d CHILD %s/%s\n", st, svc, inst, con, disp_p1, child
+    }
+  }
+}
+'
+exit 0
